@@ -7,19 +7,18 @@ import time
 import base64
 import asyncio
 import time
+from time import strftime
 import websockets
 import unittest
 import logging
 import sys
 import requests
 import os
+import math
 from pprint import pprint
 from dotenv import load_dotenv
 import telegram
 
-"""
-A monitor that detects unusual activitiy on coins
-"""
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 COINBASE_API = "https://api.exchange.coinbase.com"
 COINBASE_URI = "wss://ws-feed.exchange.coinbase.com"
@@ -28,22 +27,66 @@ load_dotenv()
 TELEGRAMBOTKEY = os.getenv("TELEGRAMBOTKEY")
 bot = telegram.Bot(token=TELEGRAMBOTKEY)
 
+"""
+A monitor that detects unusual activitiy on coins
+"""
+
 
 class ActivityMonitor:
     def __init__(self):
         self.alerts = {}
+        self.ALERT_THRESHOLD = 3
+        self.THRESHOLD_ORDER_SIZE = 5000  # minimum order size
+        self.THRESHOLD_VOL = 1000000  # min volume, changes get_threshold()
+        self.ALERT_TIMEOUT = 1800 * 1  # alert timeout in seconds
         self.products = []
         self.product_data = {}
         self.blacklisted = ["RAI-USD"]
         self.coingecko_data = {}
-
         self._fetch_products()
         self._fetch_data()
+
+        self._reset_alerts(self.products)
         self._fetch_marketcaps()
 
-    def emit_alert(self, message):
+    def emit_bot_message(self, message):
         bot.send_message(
             text=message, chat_id="@CoinbaseWatcher", parse_mode="HTML")
+
+    def get_alert_count(self, product, side):
+        return len(self.alerts[product][side])
+
+    def get_elapsed_time(self, alert, time_btwn_last_alert=False, seconds=False):
+        """Get time difference between first and last alert
+            * Seconds = False returns a formatted string [default]
+            * Seconds = True returns an int of seconds between alerts
+        """
+
+        if len(alert) == 1:
+            elapsed_time = int(time.time()-alert[0]['timestamp'])
+        else:
+            if time_btwn_last_alert:
+                elapsed_time = int(time.time()-alert[-1]['timestamp'])
+                print(elapsed_time)
+            else:
+                elapsed_time = int(
+                    alert[-1]['timestamp'] - alert[0]['timestamp'])
+
+        if elapsed_time < 1:
+            elapsed_time = 1
+
+        if seconds:
+            return elapsed_time
+
+        m, s = divmod(elapsed_time, 60)
+        h, m = divmod(m, 60)
+
+        if elapsed_time < 60:
+            return f"{s}s"
+        elif elapsed_time < 3600:
+            return f"{m}m {s}s"
+        else:
+            return f"{h}h {m}m {s}s"
 
     def analyze(self, match):
         product = match['product_id']
@@ -54,56 +97,104 @@ class ActivityMonitor:
         # For alert to trigger, buy/sell has to be > x% of volume
         total = price*size
         vol_24h = float(self.product_data[product]['volume'])*price
-        threshold = get_threshold(vol_24h)
+        threshold = min_order_size(
+            self.THRESHOLD_ORDER_SIZE, vol_24h, self.THRESHOLD_VOL)
 
-        if (total > (vol_24h*threshold)):
-            perc_change = percentage_change(price, float(
-                self.product_data[product]['open']))
+        if (total > threshold):
+            print(f"{product} -> {side} -> ${total:,.0f}")
 
-            pnd = "Pumping" if match['side'] == "buy" else "Dumping"
-            pnd_icon = "🚀" if match['side'] == "buy" else "👹"
+            # If time between last alert(s) for [side] > self.ALERT_TIMEOUT, reset. Make sure we have at least 1 alert
+            if self.get_alert_count(product, side) > 0:
+                last_alert_elapsed = self.get_elapsed_time(
+                    self.alerts[product][side], time_btwn_last_alert=True, seconds=True)
 
-            alert_msg = [f"🚨 {product} is {pnd} on Coinbase! {pnd_icon}",
-                         f"\t 💸 Price: ${price:,} ({perc_change:.2f}%)",
-                         f"\t 🎒 Size: {size:,.2f} {product.split('-')[0]}",
-                         f"\t 📊 Volume of {side.upper()}: ${total:,.0f}",
-                         f"\t 📊 24h Volume: ${vol_24h:,.0f}\n"]
+                if last_alert_elapsed > self.ALERT_TIMEOUT:
+                    self._reset_alerts(product)
+            # Need n consecutive alerts to trigger message emission
 
-            if self.coingecko_data and product in self.coingecko_data:
-                cap = self.coingecko_data[product]['market_cap'] * price
-                if cap is not None and cap > 0:
-                    alert_msg.append(
-                        f"\t 🏦 Market Cap: ${cap:,.0f}")
+            # if side == "sell" and self.get_alert_count(product, 'buy') > 0:
+            #     self._reset_alerts(product)
+            # if side == "buy" and self.get_alert_count(product, 'sell') > 0:
+            #     self._reset_alerts(product)
 
-                fdv = self.coingecko_data[product]['fdv']
-                if fdv is not None and fdv > 0:
-                    alert_msg.append(f"\t 💰 FDV: ${fdv:,.0f}")
+            ts = time.time()
+            self.alerts[product][side].append(
+                {'size': size, 'price': price, 'total': total, 'timestamp': ts})
 
-                circ_supply = self.coingecko_data[product]['circulating_supply']
-                if circ_supply is not None and circ_supply > 0:
-                    alert_msg.append(f"\t ♻️ Circ. Supply: {circ_supply:,.0f}")
+            if abs(self.get_alert_count(product, 'buy')-self.get_alert_count(product, 'sell')) >= self.ALERT_THRESHOLD:
 
-                total_supply = self.coingecko_data[product]['total_supply']
-                if total_supply is not None and total_supply > 0:
-                    alert_msg.append(
-                        f"\t 🪙 Total Supply: {total_supply:,.0f}")
+                perc_change = percentage_change(price, float(
+                    self.product_data[product]['open']))
 
-            [print(m) for m in alert_msg]
-            alertMessage = ""
-            for i, m in enumerate(alert_msg):
-                if i == 0:
-                    alertMessage = m
-                else:
-                    alertMessage += f"\n\t{m}"
+                pnd_icon = {'sell': "💩", 'buy': "🚀"}
 
-            # Update volume + other stats after alert is triggered
-            self._fetch_data(product)
+                activity_icon = {'sell': "🍟", 'buy': "✳️"}
 
-            # alertMessage = f"🚨 {product} is {pnd} on Coinbase! {pnd_icon}\n\t\t 💸 Price: ${price} ({perc_change:.2f}%)\n\t\t  🎒 Size: {size:,.2f} {product.split('-')[0]}\n\t\t 📊 Volume of {side.upper()}: ${total:,.2f}\n\t\t 📊 24h Volume: ${vol_24h:,.2f}\n\t\t 📊 30d Volume: ${vol_30d:,.2f}"
+                alert_elapsed_time = self.get_elapsed_time(
+                    self.alerts[product][side])
 
-            self.emit_alert(alertMessage)
+                alert_total = sum_dicts(self.alerts[product][side], 'total')
+                alert_size = sum_dicts(self.alerts[product][side], 'size')
 
-        self._update_data(product, match, match=True)
+                alert_msg = [emojifactory(pnd_icon[side], int(alert_total/30000)),
+                             f"\t\t\t\t<b>{product}</b>",
+                             f" {activity_icon[side]} {side.title()}ing activity in {alert_elapsed_time} {activity_icon[side]}\n"
+                             f"\t 💸 Price: ${price:,} ({perc_change:.2f}%)",
+                             f"\t 🎒 Size: {alert_size:,.2f} {product.split('-')[0]}",
+                             f"\t 📊 {side.title()} Volume: ${alert_total:,.0f}",
+                             f"\t 📊 24h Volume: ${vol_24h:,.0f}\n"]
+
+                if self.coingecko_data and product in self.coingecko_data:
+                    # API data can lag so multiply supply by latest price instead
+                    cap = self.coingecko_data[product]['circulating_supply'] * price
+                    if cap is not None and cap > 0:
+                        cap_type = ""
+                        if cap < 100000000:  # 100m
+                            cap_type = "🍔 Shit Cap 🍔"
+                        elif cap < 1000000000:  # 1B
+                            cap_type = "🎩 Mid Cap 🎩"
+                        elif cap < 50000000000:  # 50B
+                            cap_type = "🐳 Large Cap 🐳"
+                        elif cap >= 50000000000:  # >50B
+                            cap_type = "👑🏆 Elite 🏆👑"
+
+                        if cap_type:
+                            alert_msg.append(f"\t\t {cap_type}")
+
+                        alert_msg.append(
+                            f"\t 🏦 Market Cap: ${cap:,.0f}")
+
+                    fdv = self.coingecko_data[product]['fdv']
+                    if fdv is not None and fdv > 0:
+                        alert_msg.append(f"\t 💰 FDV: ${fdv:,.0f}")
+
+                    circ_supply = self.coingecko_data[product]['circulating_supply']
+                    if circ_supply is not None and circ_supply > 0:
+                        alert_msg.append(
+                            f"\t ♻️ Circ Supply: {circ_supply:,.0f}")
+
+                    total_supply = self.coingecko_data[product]['total_supply']
+                    if total_supply is not None and total_supply > 0:
+                        alert_msg.append(
+                            f"\t 🪙 Total Supply: {total_supply:,.0f}")
+
+                [print(m) for m in alert_msg]
+                alertMessage = ""
+                for i, m in enumerate(alert_msg):
+                    if i == 0:
+                        alertMessage = m
+                    else:
+                        alertMessage += f"\n\t{m}"
+
+                self.emit_bot_message(alertMessage)
+
+                # Update volume + other stats after alert is triggered
+                self._reset_alerts([product])
+                self._fetch_data(product)
+
+    def _reset_alerts(self, products):
+        for p in products:
+            self.alerts[p] = {'buy': [], 'sell': []}
 
     def _fetch_products(self):
         start = time.process_time()
@@ -144,12 +235,8 @@ class ActivityMonitor:
         url = f"{COINBASE_API}/products/{product}/stats"
         return api_data(url)
 
-    def _update_data(self, product, data, match=False):
-        # If it's not a match, it's stats
-        if match:
-            self.product_data[product]['last'] = data['price']
-        else:
-            self.product_data[product].update(data)
+    def _update_data(self, product, data):
+        self.product_data[product].update(data)
 
     def _fetch_marketcaps(self):
         """
@@ -188,23 +275,45 @@ class ActivityMonitor:
 
 
 def api_data(url, headers={"Accept": "application/json"}):
-    response = requests.request("GET", url, headers=headers)
-    return json.loads(response.text)
+    try:
+        response = requests.request("GET", url, headers=headers)
+        if response.ok:
+            return json.loads(response.text)
+    except requests.exceptions.RequestException as e:
+        print(e)
+
+    return ""
 
 
-def percentage_change(price, last_price):
-    return round((price-last_price)/price, 2)*100
+def percentage_change(last_price, price):
+    return round((last_price-price)/price, 2)*100
 
 
-def get_threshold(volume):
-    if volume <= 1000000:  # 1m
-        return .015
-    if volume <= 10000000:  # 10m
-        return .005
-    elif volume <= 100000000:  # 100m
-        return .0025
+def emojifactory(emoji, count):
+    return emoji*count if count > 0 else emoji
+
+
+def sum_dicts(list_of_dicts, key):
+    total = 0.0
+    for d in list_of_dicts:
+        total += d[key]
+    return total
+
+
+def min_order_size(order_size, volume, treshold_vol):
+
+    if volume <= treshold_vol:  # 1m
+        return order_size
+    elif volume <= treshold_vol*10:  # 10m
+        return order_size*2
+    elif volume <= treshold_vol*25:  # 25m
+        return order_size*3
+    elif volume <= treshold_vol*100:  # 100m
+        return order_size*6
+    elif volume <= treshold_vol*300:  # 300m
+        return order_size*7
     else:
-        return .00175
+        return order_size*25
 
 
 """
@@ -227,18 +336,14 @@ async def main_loop():
             while True:
                 response = await websocket.recv()
                 match = json.loads(response)
+
                 if monitor and (match['type'] == "last_match" or match['type'] == "match"):
                     monitor.analyze(match)
-                # if monitor != None:
-                #     print(processor.stringify())
-                #     sys.stdout.flush()
+
         except websockets.exceptions.ConnectionClosedError:
             print("Error caught")
             sys.exit(1)
 
 
 if __name__ == '__main__':
-    # products = fetch_products()
-    # pprint(products)
-    # fetch_volumes(products)
     asyncio.run(main_loop())
