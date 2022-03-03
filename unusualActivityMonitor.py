@@ -150,7 +150,7 @@ class ActivityMonitor:
                     if cap is not None and cap > 0:
                         cap_type = ""
                         if cap < 100000000:  # 100m
-                            cap_type = "🍔 Shit Cap 🍔"
+                            cap_type = "🍔 Low Cap 🍔"
                         elif cap < 1000000000:  # 1B
                             cap_type = "🎩 Mid Cap 🎩"
                         elif cap < 50000000000:  # 50B
